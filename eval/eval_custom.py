@@ -1,9 +1,13 @@
+import os
+# Enable MPS fallback to CPU for unsupported ops (like _upsample_bicubic2d_aa)
+# MUST be set before torch is imported!
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+import sys
 import argparse
 from pathlib import Path
 import numpy as np
 import torch
-import os
-import sys
 import matplotlib.pyplot as plt
 from scipy.spatial.transform import Rotation
 
@@ -21,6 +25,9 @@ from vggt.utils.eval_utils import (
     load_images_rgb,
     infer_vggt_and_reconstruct,
     evaluate_scene_and_save,
+    get_optimal_device,
+    clear_device_cache,
+    estimate_frames_chunk_size,
 )
 
 # Import pose visualization libraries (optional EVO support)
@@ -171,6 +178,14 @@ def main():
         help="Visualize attention maps during inference",
     )
 
+    parser.add_argument(
+        "--max_memory_gb",
+        type=float,
+        default=None,
+        help="Maximum memory budget in GB. Defaults to auto-detect. "
+             "Controls DPT head frame chunk size to limit peak memory.",
+    )
+
     args = parser.parse_args()
     torch.manual_seed(33)
 
@@ -215,22 +230,58 @@ def main():
         )
         return
 
-    # Force use of bf16 dtype
-    # dtype = torch.bfloat16
-    dtype = torch.float32
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Auto-detect device and dtype for optimal performance
+    device = get_optimal_device()
+    if device.type == "mps":
+        # Lower precision (float16/bfloat16) causes numerical collapse in the 
+        # Vision Transformer, producing empty point clouds.
+        dtype = torch.float32
+    elif device.type == "cuda":
+        dtype = torch.bfloat16
+    else:
+        dtype = torch.float32
+
+    print(f"🖥️  Device: {device}, dtype: {dtype}")
+
+    # Determine memory budget
+    if args.max_memory_gb is None:
+        if device.type == "mps":
+            # M4 Macs typically have 16-128GB unified memory; use conservative default
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ["sysctl", "-n", "hw.memsize"],
+                    capture_output=True, text=True, check=True
+                )
+                total_mem_gb = int(result.stdout.strip()) / (1024 ** 3)
+                max_memory_gb = max(4.0, total_mem_gb - 4.0)  # Leave 4GB headroom
+            except Exception:
+                max_memory_gb = 12.0  # Safe default
+        else:
+            max_memory_gb = 16.0  # Default for CUDA/CPU
+    else:
+        max_memory_gb = args.max_memory_gb
+    print(f"💾 Memory budget: {max_memory_gb:.1f} GB")
 
     # Load VGGT model
     print(f"🔄 Loading model: {args.ckpt_path}")
     model = VGGT(merging=args.merging, vis_attn_map=args.vis_attn_map, dtype=dtype, device=device)
     ckpt = torch.load(args.ckpt_path, map_location="cpu")
     incompat = model.load_state_dict(ckpt, strict=False)
-    # if incompat.missing_keys or incompat.unexpected_keys:
-    #     print(f"⚠️  Partially incompatible keys when loading model: {incompat}")
-    # model = model.cuda().eval()
+    del ckpt  # Free checkpoint memory
     model = model.eval()
-    model = model.to(dtype)
-    print(f"✅ Model loaded")
+    model = model.to(dtype).to(device)
+    
+    # Keep the output heads in float32 for precision, as they are small and 
+    # prone to precision issues/overflows in float16 (producing empty point clouds).
+    if model.depth_head is not None:
+        model.depth_head = model.depth_head.float()
+    if model.point_head is not None:
+        model.point_head = model.point_head.float()
+    if model.camera_head is not None:
+        model.camera_head = model.camera_head.float()
+        
+    print(f"✅ Model loaded on {device}")
 
     # Load scene data
     image_paths = get_sorted_image_paths(color_dir)
@@ -292,6 +343,12 @@ def main():
         # Update attention layer patch dimensions in the model
         model.update_patch_dimensions(patch_width, patch_height)
 
+        # Estimate chunk size for DPT head
+        frames_chunk_size = estimate_frames_chunk_size(
+            max_memory_gb, len(frame_ids), patch_height * 14, patch_width * 14, dtype
+        )
+        print(f"📦 DPT head frame chunk size: {frames_chunk_size}")
+
         # Inference + Reconstruction
         print(f"🚀 Start inference and reconstruction...")
         (
@@ -302,14 +359,18 @@ def main():
             all_cam_to_world_mat,
             inference_time_ms,
         ) = infer_vggt_and_reconstruct(
-            model, vgg_input, dtype, args.depth_conf_thresh, image_paths
+            model, vgg_input, dtype, args.depth_conf_thresh, image_paths,
+            device=device,
+            frames_chunk_size=frames_chunk_size,
         )
         print(f"⏱️  Inference time: {inference_time_ms:.2f}ms")
 
         # Check results
-        if not all_cam_to_world_mat or not all_world_points:
-            print(f"❌ Error: Failed to obtain valid camera poses or point clouds")
+        if not all_cam_to_world_mat:
+            print(f"❌ Error: Failed to obtain valid camera poses")
             return
+        if not all_world_points:
+            print(f"⚠️  Warning: No valid point clouds generated. This can happen if depth_conf_thresh ({args.depth_conf_thresh}) is too high.")
 
         # print(f"✅ Inference done, obtained {len(all_world_points)} point sets")
 

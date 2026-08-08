@@ -27,7 +27,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         merging=0,
         vis_attn_map=False,
         dtype=torch.bfloat16,
-        device=torch.device("cuda"),
+        device=None,
     ):
         super().__init__()
 
@@ -100,6 +100,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         images: torch.Tensor,
         query_points: torch.Tensor = None,
         image_paths: list = None,
+        frames_chunk_size: int = None,
     ):
         """
         Forward pass of the VGGT model.
@@ -151,26 +152,34 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         predictions = {}
 
         if self.camera_head is not None:
-            pose_enc_list = self.camera_head(aggregated_tokens_list)
+            camera_dtype = next(self.camera_head.parameters()).dtype if len(list(self.camera_head.parameters())) > 0 else images.dtype
+            camera_tokens = [t.to(camera_dtype) for t in aggregated_tokens_list]
+            pose_enc_list = self.camera_head(camera_tokens)
             predictions["pose_enc"] = pose_enc_list[
                 -1
             ]  # pose encoding of the last iteration
             predictions["pose_enc_list"] = pose_enc_list
 
         if self.depth_head is not None:
+            depth_dtype = next(self.depth_head.parameters()).dtype if len(list(self.depth_head.parameters())) > 0 else images.dtype
+            depth_tokens = [t.to(depth_dtype) for t in aggregated_tokens_list]
             depth, depth_conf = self.depth_head(
-                aggregated_tokens_list,
-                images=images,
+                depth_tokens,
+                images=images.to(depth_dtype),
                 patch_start_idx=patch_start_idx,
+                frames_chunk_size=frames_chunk_size,
             )
             predictions["depth"] = depth
             predictions["depth_conf"] = depth_conf
 
         if self.point_head is not None:
+            point_dtype = next(self.point_head.parameters()).dtype if len(list(self.point_head.parameters())) > 0 else images.dtype
+            point_tokens = [t.to(point_dtype) for t in aggregated_tokens_list]
             pts3d, pts3d_conf = self.point_head(
-                aggregated_tokens_list,
-                images=images,
+                point_tokens,
+                images=images.to(point_dtype),
                 patch_start_idx=patch_start_idx,
+                frames_chunk_size=frames_chunk_size,
             )
             predictions["world_points"] = pts3d
             predictions["world_points_conf"] = pts3d_conf

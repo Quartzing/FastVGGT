@@ -231,11 +231,11 @@ class DinoVisionTransformer(nn.Module):
             # Simply specify an output size instead of a scale factor
             kwargs["size"] = (w0, h0)
         patch_pos_embed = nn.functional.interpolate(
-            patch_pos_embed.reshape(1, M, M, dim).permute(0, 3, 1, 2),
+            patch_pos_embed.reshape(1, M, M, dim).permute(0, 3, 1, 2).to(torch.float32),
             mode="bicubic",
             antialias=self.interpolate_antialias,
             **kwargs,
-        )
+        ).to(previous_dtype)
         assert (w0, h0) == patch_pos_embed.shape[-2:]
         patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
         return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1).to(

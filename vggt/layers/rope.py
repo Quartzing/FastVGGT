@@ -52,6 +52,8 @@ class PositionGetter:
             for each position in the grid, repeated for each batch item.
         """
         if (height, width) not in self.position_cache:
+            # Limit cache to 1 entry to prevent memory growth
+            self.position_cache.clear()
             y_coords = torch.arange(height, device=device)
             x_coords = torch.arange(width, device=device)
             positions = torch.cartesian_prod(y_coords, x_coords)
@@ -105,6 +107,8 @@ class RotaryPositionEmbedding2D(nn.Module):
         """
         cache_key = (dim, seq_len, device, dtype)
         if cache_key not in self.frequency_cache:
+            # Limit cache to 1 entry to prevent memory growth
+            self.frequency_cache.clear()
             # Compute frequency bands
             exponents = torch.arange(0, dim, 2, device=device) / dim
             inv_freq = 1.0 / (self.base_frequency**exponents)

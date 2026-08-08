@@ -27,6 +27,47 @@ from vggt.utils.geometry import unproject_depth_map_to_point_map
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 
+def get_optimal_device():
+    """Auto-detect the best available device: MPS → CUDA → CPU."""
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    elif torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def clear_device_cache(device):
+    """Clear device memory cache for MPS or CUDA."""
+    if device.type == "mps":
+        torch.mps.empty_cache()
+    elif device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
+def estimate_frames_chunk_size(
+    max_memory_gb: float,
+    num_frames: int,
+    image_h: int,
+    image_w: int,
+    dtype: torch.dtype,
+) -> int:
+    """
+    Estimate how many frames can be processed at once in the DPT head
+    given a memory budget.
+
+    Returns a chunk size (at least 1).
+    """
+    bytes_per_element = 2 if dtype in (torch.float16, torch.bfloat16) else 4
+    # Rough estimate: DPT head peak is ~4x the input token size per frame
+    # Each frame: patch_tokens(1041) * embed_dim(2048) * 4 (intermediate multiplier)
+    per_frame_bytes = 1041 * 2048 * bytes_per_element * 4
+    # Add image tensor memory per frame
+    per_frame_bytes += 3 * image_h * image_w * bytes_per_element
+    available_bytes = max_memory_gb * (1024 ** 3) * 0.5  # Use 50% of budget for DPT
+    chunk_size = max(1, int(available_bytes / per_frame_bytes))
+    return min(chunk_size, num_frames)
+
+
 def shuffle_deque(dq, seed=None):
     # Set the random seed for reproducibility
     if seed is not None:
@@ -394,31 +435,38 @@ def load_poses(path):
 
 def get_vgg_input_imgs(images: np.ndarray):
     to_tensor = TF.ToTensor()
-    vgg_input_images = []
     final_width = None
     final_height = None
 
-    for image in images:
+    # First pass: determine final dimensions
+    sample_img = Image.fromarray(images[0], mode="RGB")
+    width, height = sample_img.size
+    new_width = 518
+    new_height = round(height * (new_width / width) / 14) * 14
+    if new_height > 518:
+        final_height = 518
+    else:
+        final_height = new_height
+    final_width = new_width
+
+    # Pre-allocate output tensor to avoid list + stack (saves peak memory)
+    num_frames = len(images)
+    vgg_input_images = torch.empty(num_frames, 3, final_height, final_width, dtype=torch.float32)
+
+    for idx, image in enumerate(images):
         img = Image.fromarray(image, mode="RGB")
         width, height = img.size
-        # Resize image, maintain aspect ratio, ensure height is multiple of 14
         new_width = 518
         new_height = round(height * (new_width / width) / 14) * 14
         img = img.resize((new_width, new_height), Image.Resampling.BICUBIC)
-        img = to_tensor(img)  # Convert to tensor (0, 1)
+        img_tensor = to_tensor(img)  # Convert to tensor (0, 1)
 
         # If height exceeds 518, perform center cropping
         if new_height > 518:
             start_y = (new_height - 518) // 2
-            img = img[:, start_y : start_y + 518, :]
-            final_height = 518
-        else:
-            final_height = new_height
+            img_tensor = img_tensor[:, start_y : start_y + 518, :]
 
-        final_width = new_width
-        vgg_input_images.append(img)
-
-    vgg_input_images = torch.stack(vgg_input_images)
+        vgg_input_images[idx] = img_tensor
 
     # Calculate the patch dimensions (divided by 14 for patch size)
     patch_width = final_width // 14  # 518 // 14 = 37
@@ -429,7 +477,7 @@ def get_vgg_input_imgs(images: np.ndarray):
 
 def get_sorted_image_paths(images_dir):
     image_paths = []
-    for ext in ["*.jpg", "*.png", "*.jpeg"]:
+    for ext in ["*.JPG", "*.jpg", "*.png", "*.jpeg"]:
         image_paths.extend(sorted(images_dir.glob(ext)))
     # image_paths.sort(key=lambda x: int(x.stem))
     return image_paths
@@ -597,6 +645,8 @@ def infer_vggt_and_reconstruct(
     dtype: torch.dtype,
     depth_conf_thresh: float,
     image_paths: list = None,
+    device: torch.device = None,
+    frames_chunk_size: int = None,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -605,39 +655,68 @@ def infer_vggt_and_reconstruct(
     List[np.ndarray],
     float,
 ]:
-    # torch.cuda.synchronize()
+    if device is None:
+        device = get_optimal_device()
+
+    # Determine autocast device type
+    device_type = device.type
+    # MPS autocast is not fully supported in PyTorch 2.3.1; fall back to no autocast.
+    # The model and inputs are already explicitly cast to float16, so it's fine.
+    use_autocast = device_type in ("cuda", "cpu")
+
     start = time.time()
-    with torch.autocast(device_type="cpu", dtype=dtype):
-        vgg_input_cuda = vgg_input.cpu().to(dtype)
-        predictions = model(vgg_input_cuda, image_paths=image_paths)
-    # torch.cuda.synchronize()
+
+    # Move input to device
+    vgg_input_device = vgg_input.to(device=device, dtype=dtype)
+
+    if use_autocast:
+        with torch.autocast(device_type=device_type, dtype=dtype):
+            predictions = model(vgg_input_device, image_paths=image_paths, frames_chunk_size=frames_chunk_size)
+    else:
+        predictions = model(vgg_input_device, image_paths=image_paths, frames_chunk_size=frames_chunk_size)
+
+    del vgg_input_device
+
     end = time.time()
     inference_time_ms = (end - start) * 1000.0
 
-    extrinsic, intrinsic = pose_encoding_to_extri_intri(
-        predictions["pose_enc"], (vgg_input.shape[2], vgg_input.shape[3])
-    )
+    # Move results to CPU immediately to free device memory
+    pose_enc = predictions["pose_enc"].detach().float().cpu()
+    depth_tensor = predictions["depth"].detach().float().cpu()
+    depth_conf = predictions["depth_conf"].detach().float().cpu()
 
-    depth_tensor = predictions["depth"]
-    depth_conf = predictions["depth_conf"]
-    depth_conf_np = depth_conf[0].detach().float().cpu().numpy()
+    # Free device memory from predictions
+    del predictions
+    clear_device_cache(device)
+
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(
+        pose_enc, (vgg_input.shape[2], vgg_input.shape[3])
+    )
+    del pose_enc
+
+    depth_conf_np = depth_conf[0].numpy()
     depth_mask = depth_conf_np >= depth_conf_thresh
-    depth_filtered = depth_tensor[0].detach().float().cpu().numpy()
+    del depth_conf
+
+    depth_filtered = depth_tensor[0].numpy()
     depth_filtered[~depth_mask] = np.nan
     depth_np = depth_filtered
+    del depth_tensor, depth_mask
 
     extrinsic_np = extrinsic[0].detach().float().cpu().numpy()
     intrinsic_np = intrinsic[0].detach().float().cpu().numpy()
+    del extrinsic, intrinsic
 
     world_points = unproject_depth_map_to_point_map(
         depth_np, extrinsic_np, intrinsic_np
     )
+    del depth_np
+
     all_points: List[np.ndarray] = []
     all_colors: List[np.ndarray] = []
 
-    # Prepare RGB images aligned with vgg_input for coloring point clouds (0-255, uint8)
-    vgg_np = vgg_input.detach().float().cpu().numpy()  # [S, 3, H, W] in [0,1]
-
+    # Process point clouds frame-by-frame to limit peak numpy memory
+    # Keep vgg_input on CPU for color extraction (it's already there)
     for frame_idx in range(world_points.shape[0]):
         points = world_points[frame_idx].reshape(-1, 3)
         valid_mask = ~np.isnan(points).any(axis=1) & ~np.isinf(points).any(axis=1)
@@ -645,14 +724,18 @@ def infer_vggt_and_reconstruct(
         if len(valid_points) > 0:
             all_points.append(valid_points)
 
-            # Generate corresponding colors
-            img_chw = vgg_np[frame_idx]  # [3, H, W]
+            # Generate colors from vgg_input (already CPU float32)
+            img_chw = vgg_input[frame_idx].float().numpy()  # [3, H, W]
             img_hwc = (
                 (np.transpose(img_chw, (1, 2, 0)) * 255.0).clip(0, 255).astype(np.uint8)
             )  # [H, W, 3] uint8
             rgb_flat = img_hwc.reshape(-1, 3)
             valid_colors = rgb_flat[valid_mask]
             all_colors.append(valid_colors)
+            del img_chw, img_hwc, rgb_flat
+        del points, valid_mask
+
+    del world_points
 
     camera_poses = to_homogeneous(extrinsic_np)
     all_cam_to_world_mat = list(camera_poses)

@@ -224,6 +224,8 @@ class DPTHead(nn.Module):
         Implementation of the forward pass through the DPT head.
 
         This method processes a specific chunk of frames from the sequence.
+        Runs in float32 internally to avoid float16 precision loss in
+        convolution/refinement layers.
 
         Args:
             aggregated_tokens_list (List[Tensor]): List of token tensors from different transformer layers.
@@ -235,6 +237,8 @@ class DPTHead(nn.Module):
         Returns:
             Tensor or Tuple[Tensor, Tensor]: Feature maps or (predictions, confidence).
         """
+        original_dtype = images.dtype
+
         if frames_start_idx is not None and frames_end_idx is not None:
             images = images[:, frames_start_idx:frames_end_idx].contiguous()
 
@@ -254,14 +258,17 @@ class DPTHead(nn.Module):
 
             x = x.reshape(B * S, -1, x.shape[-1])
 
+            # Cast to float32 for DPT head precision (small overhead, big quality gain)
+            x = x.float()
+
             x = self.norm(x)
 
             x = x.permute(0, 2, 1).reshape((x.shape[0], x.shape[-1], patch_h, patch_w))
 
-            x = self.projects[dpt_idx](x)
+            x = self.projects[dpt_idx](x.to(self.projects[dpt_idx].weight.dtype)).float()
             if self.pos_embed:
                 x = self._apply_pos_embed(x, W, H)
-            x = self.resize_layers[dpt_idx](x)
+            x = self.resize_layers[dpt_idx](x.to(self.resize_layers[dpt_idx].weight.dtype if hasattr(self.resize_layers[dpt_idx], 'weight') else x.dtype)).float()
 
             out.append(x)
             dpt_idx += 1
@@ -283,15 +290,15 @@ class DPTHead(nn.Module):
             out = self._apply_pos_embed(out, W, H)
 
         if self.feature_only:
-            return out.view(B, S, *out.shape[1:])
+            return out.view(B, S, *out.shape[1:]).to(original_dtype)
 
         out = self.scratch.output_conv2(out)
         preds, conf = activate_head(
             out, activation=self.activation, conf_activation=self.conf_activation
         )
 
-        preds = preds.view(B, S, *preds.shape[1:])
-        conf = conf.view(B, S, *conf.shape[1:])
+        preds = preds.view(B, S, *preds.shape[1:]).to(original_dtype)
+        conf = conf.view(B, S, *conf.shape[1:]).to(original_dtype)
         return preds, conf
 
     def _apply_pos_embed(
@@ -574,6 +581,7 @@ def custom_interpolate(
 ) -> torch.Tensor:
     """
     Custom interpolate to avoid INT_MAX issues in nn.functional.interpolate.
+    Also handles float16 -> float32 casting for MPS compatibility.
     """
     if size is None:
         size = (int(x.shape[-2] * scale_factor), int(x.shape[-1] * scale_factor))
@@ -581,6 +589,11 @@ def custom_interpolate(
     INT_MAX = 1610612736
 
     input_elements = size[0] * size[1] * x.shape[0] * x.shape[1]
+
+    original_dtype = x.dtype
+    # MPS/CPU interpolate may not support float16; cast to float32
+    if x.dtype == torch.float16:
+        x = x.float()
 
     if input_elements > INT_MAX:
         chunks = torch.chunk(x, chunks=(input_elements // INT_MAX) + 1, dim=0)
@@ -591,8 +604,8 @@ def custom_interpolate(
             for chunk in chunks
         ]
         x = torch.cat(interpolated_chunks, dim=0)
-        return x.contiguous()
+        return x.contiguous().to(original_dtype)
     else:
         return nn.functional.interpolate(
             x, size=size, mode=mode, align_corners=align_corners
-        )
+        ).to(original_dtype)

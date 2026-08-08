@@ -74,10 +74,18 @@ class Aggregator(nn.Module):
         merging=0,
         vis_attn_map=False,
         dtype=torch.bfloat16,
-        device=torch.device("cuda"),
+        device=None,
     ):
         super().__init__()
 
+        # Auto-detect device: MPS → CUDA → CPU
+        if device is None:
+            if torch.backends.mps.is_available():
+                device = torch.device("mps")
+            elif torch.cuda.is_available():
+                device = torch.device("cuda")
+            else:
+                device = torch.device("cpu")
         self.device = device
         self.dtype = dtype
 
@@ -166,6 +174,13 @@ class Aggregator(nn.Module):
             )
 
         self.use_reentrant = False  # hardcoded to False
+
+    def _clear_device_cache(self):
+        """Clear device memory cache (MPS or CUDA)."""
+        if self.device.type == "mps":
+            torch.mps.empty_cache()
+        elif self.device.type == "cuda":
+            torch.cuda.empty_cache()
 
     def __build_patch_embed__(
         self,
@@ -303,29 +318,7 @@ class Aggregator(nn.Module):
             # torch.cuda.empty_cache()
 
             need_intermediates = True if block_num in block4DPT_idx else False
-            if block_num % 1 == 0:
-                # Clean up RoPE cache to prevent accumulation
-                if hasattr(self, "rope") and self.rope is not None:
-                    if hasattr(self.rope, "frequency_cache"):
-                        self.rope.frequency_cache.clear()
-                # Clean up position cache
-                if (
-                    hasattr(self, "position_getter")
-                    and self.position_getter is not None
-                ):
-                    if hasattr(self.position_getter, "position_cache"):
-                        # Keep only current size cache, clean up others
-                        current_cache = self.position_getter.position_cache.copy()
-                        if (
-                            len(current_cache) > 1
-                        ):  # If there are multiple cache entries
-                            self.position_getter.position_cache.clear()
-                            # Keep only the most recently used one
-                            if current_cache:
-                                key = list(current_cache.keys())[-1]
-                                self.position_getter.position_cache[key] = (
-                                    current_cache[key]
-                                )
+
             # Avoid saving block_num to instance variable to reduce references
             for attn_type in self.aa_order:
                 if attn_type == "frame":
@@ -388,7 +381,7 @@ class Aggregator(nn.Module):
             del pos_special
         if "pos_original" in locals():
             del pos_original
-        # torch.cuda.empty_cache()  # Final cleanup
+        self._clear_device_cache()
 
         return output_list, self.patch_start_idx
 

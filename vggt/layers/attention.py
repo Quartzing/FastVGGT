@@ -68,6 +68,7 @@ class Attention(nn.Module):
             .permute(2, 0, 3, 1, 4)
         )
         q, k, v = qkv.unbind(0)
+        del qkv  # Free 3x memory immediately
         q, k = self.q_norm(q), self.k_norm(k)
 
         if self.rope is not None:

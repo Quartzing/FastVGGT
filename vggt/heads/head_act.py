@@ -70,8 +70,13 @@ def activate_head(out, activation="norm_exp", conf_activation="expp1"):
     Returns:
         Tuple of (3D points tensor, confidence tensor)
     """
+    original_dtype = out.dtype
     # Move channels from last dim to the 4th dimension => (B, H, W, C)
     fmap = out.permute(0, 2, 3, 1)  # B,H,W,C expected
+
+    # Cast to float32 for numerically sensitive operations (exp/expm1 overflow in float16)
+    if fmap.dtype == torch.float16:
+        fmap = fmap.float()
 
     # Split into xyz (first C-1 channels) and confidence (last channel)
     xyz = fmap[:, :, :, :-1]
@@ -109,7 +114,7 @@ def activate_head(out, activation="norm_exp", conf_activation="expp1"):
     else:
         raise ValueError(f"Unknown conf_activation: {conf_activation}")
 
-    return pts3d, conf_out
+    return pts3d.to(original_dtype), conf_out.to(original_dtype)
 
 
 def inverse_log_transform(y):
